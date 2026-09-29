@@ -1,0 +1,296 @@
+"""
+Roblox 가상 피아노 자동 연주기
+- 텍스트 악보를 붙여넣고 [연주 시작]을 누르면 카운트다운 후 키를 대신 눌러줍니다.
+- F8: 연주 중지
+악보 형식 (Virtual Piano 스타일):
+  소문자/숫자      -> 해당 키
+  대문자, ! @ # $ % ^ & * ( )  -> Shift + 키 (반음)
+  [abc]           -> 화음 (동시에 누름)
+  공백, 줄바꿈, |  -> 쉼 (간격 1칸)
+"""
+import ctypes
+import threading
+import time
+import tkinter as tk
+from ctypes import wintypes
+from tkinter import messagebox
+
+# ---------------- SendInput (스캔코드 방식) ----------------
+PUL = ctypes.POINTER(ctypes.c_ulong)
+
+
+class KeyBdInput(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", PUL),
+    ]
+
+
+class HardwareInput(ctypes.Structure):
+    _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD), ("wParamH", wintypes.WORD)]
+
+
+class MouseInput(ctypes.Structure):
+    _fields_ = [
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", PUL),
+    ]
+
+
+class InputUnion(ctypes.Union):
+    _fields_ = [("ki", KeyBdInput), ("mi", MouseInput), ("hi", HardwareInput)]
+
+
+class Input(ctypes.Structure):
+    _fields_ = [("type", wintypes.DWORD), ("ii", InputUnion)]
+
+
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_SCANCODE = 0x0008
+SHIFT_SCAN = 0x2A
+VK_F8 = 0x77
+
+
+def _send(scan, up=False):
+    flags = KEYEVENTF_SCANCODE | (KEYEVENTF_KEYUP if up else 0)
+    extra = ctypes.c_ulong(0)
+    ii = InputUnion()
+    ii.ki = KeyBdInput(0, scan, flags, 0, ctypes.pointer(extra))
+    inp = Input(1, ii)
+    ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
+
+
+SCAN = {}
+for i, c in enumerate("1234567890"):
+    SCAN[c] = 0x02 + i
+for i, c in enumerate("qwertyuiop"):
+    SCAN[c] = 0x10 + i
+for i, c in enumerate("asdfghjkl"):
+    SCAN[c] = 0x1E + i
+for i, c in enumerate("zxcvbnm"):
+    SCAN[c] = 0x2C + i
+
+SHIFT_SYMBOLS = {"!": "1", "@": "2", "#": "3", "$": "4", "%": "5",
+                 "^": "6", "&": "7", "*": "8", "(": "9", ")": "0"}
+
+
+def resolve(ch):
+    """문자 -> (스캔코드, shift 여부). 알 수 없으면 None."""
+    if ch in SHIFT_SYMBOLS:
+        return SCAN[SHIFT_SYMBOLS[ch]], True
+    if ch.isalpha() and ch.isupper():
+        low = ch.lower()
+        return (SCAN[low], True) if low in SCAN else None
+    if ch in SCAN:
+        return SCAN[ch], False
+    return None
+
+
+def parse(sheet):
+    """악보 문자열 -> [('rest',) | ('play', [(scan, shift), ...])]"""
+    events = []
+    i = 0
+    n = len(sheet)
+    while i < n:
+        ch = sheet[i]
+        if ch == "[":
+            j = sheet.find("]", i)
+            if j == -1:
+                j = n
+            keys = [resolve(c) for c in sheet[i + 1:j]]
+            keys = [k for k in keys if k]
+            if keys:
+                events.append(("play", keys))
+            i = j + 1
+            continue
+        if ch.isspace() or ch == "|":
+            events.append(("rest",))
+        else:
+            k = resolve(ch)
+            if k:
+                events.append(("play", [k]))
+        i += 1
+    return events
+
+
+def press_keys(keys, hold):
+    held = []
+    for scan, shift in keys:
+        if shift:
+            _send(SHIFT_SCAN, False)
+        _send(scan, False)
+        if shift:
+            _send(SHIFT_SCAN, True)
+        held.append(scan)
+    time.sleep(hold)
+    for scan in held:
+        _send(scan, True)
+
+
+def stop_pressed():
+    return bool(ctypes.windll.user32.GetAsyncKeyState(VK_F8) & 0x8000)
+
+
+# ---------------- GUI ----------------
+class App:
+    def __init__(self, root):
+        self.root = root
+        root.title("Roblox 자동 피아노")
+        root.geometry("560x460")
+        self.stop_flag = threading.Event()
+        self.thread = None
+
+        tk.Label(root, text="악보를 붙여넣으세요 (예: t y u [ti] | o p)").pack(anchor="w", padx=10, pady=(10, 0))
+        self.text = tk.Text(root, height=14, wrap="word")
+        self.text.pack(fill="both", expand=True, padx=10, pady=6)
+
+        opt = tk.Frame(root)
+        opt.pack(fill="x", padx=10)
+        tk.Label(opt, text="음 간격(초)").grid(row=0, column=0, sticky="w")
+        self.interval = tk.DoubleVar(value=0.25)
+        tk.Spinbox(opt, from_=0.05, to=2.0, increment=0.05, width=6, textvariable=self.interval).grid(row=0, column=1, padx=6)
+        tk.Label(opt, text="시작 전 대기(초)").grid(row=0, column=2, padx=(16, 0))
+        self.countdown = tk.IntVar(value=5)
+        tk.Spinbox(opt, from_=1, to=30, width=5, textvariable=self.countdown).grid(row=0, column=3, padx=6)
+        self.loop = tk.BooleanVar(value=False)
+        tk.Checkbutton(opt, text="반복", variable=self.loop).grid(row=0, column=4, padx=(16, 0))
+
+        btns = tk.Frame(root)
+        btns.pack(fill="x", padx=10, pady=8)
+        self.start_btn = tk.Button(btns, text="연주 시작", width=14, command=self.start)
+        self.start_btn.pack(side="left")
+        tk.Button(btns, text="중지 (F8)", width=14, command=self.stop).pack(side="left", padx=8)
+
+        self.status = tk.Label(root, text="대기 중. 시작 후 로블록스 창을 클릭해 두세요.", anchor="w")
+        self.status.pack(fill="x", padx=10, pady=(0, 10))
+
+    def set_status(self, msg):
+        self.root.after(0, lambda: self.status.config(text=msg))
+
+    def start(self):
+        if self.thread and self.thread.is_alive():
+            return
+        events = parse(self.text.get("1.0", "end"))
+        if not any(e[0] == "play" for e in events):
+            messagebox.showwarning("악보 없음", "인식할 수 있는 음이 없어요.")
+            return
+        try:
+            interval = float(self.interval.get())
+            wait = int(self.countdown.get())
+        except (tk.TclError, ValueError):
+            messagebox.showwarning("설정 오류", "간격과 대기 시간을 숫자로 입력해 주세요.")
+            return
+        self.stop_flag.clear()
+        self.start_btn.config(state="disabled")
+        self.thread = threading.Thread(target=self.run, args=(events, interval, wait), daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_flag.set()
+
+    def run(self, events, interval, wait):
+        try:
+            for s in range(wait, 0, -1):
+                if self.stop_flag.is_set():
+                    return
+                self.set_status(f"{s}초 후 시작... 로블록스 창을 클릭하세요")
+                time.sleep(1)
+            hold = min(0.06, interval * 0.6)
+            while True:
+                for idx, ev in enumerate(events):
+                    if self.stop_flag.is_set() or stop_pressed():
+                        self.set_status("중지됨")
+                        return
+                    if ev[0] == "play":
+                        press_keys(ev[1], hold)
+                        time.sleep(max(0.0, interval - hold))
+                    else:
+                        time.sleep(interval)
+                    if idx % 10 == 0:
+                        self.set_status(f"연주 중... ({idx + 1}/{len(events)})")
+                if not self.loop.get():
+                    break
+            self.set_status("연주 완료")
+        finally:
+            self.root.after(0, lambda: self.start_btn.config(state="normal"))
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    App(root)
+    root.mainloop()
+
+name: Build EXE
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller
+    
+    - name: Build EXE
+      run: |
+        pyinstaller --onefile --windowed --name RobloxAutoPiano --distpath ./dist auto_piano.py
+    
+    - name: Upload artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: RobloxAutoPiano
+        path: dist/RobloxAutoPiano.exe
+
+# Roblox 자동 피아노
+
+로블록스 가상 피아노 게임에서 자동으로 키를 입력해주는 프로그램입니다.
+
+## 사용법
+
+1. 프로그램을 실행하세요
+2. 악보를 텍스트로 붙여넣으세요
+3. "연주 시작"을 누르고 로블록스 창을 클릭하세요
+4. F8을 누르면 중지됩니다
+
+## 악보 형식
+
+- 소문자/숫자: 해당 키 (예: `t y u`)
+- 대문자/특수문자: Shift+키 (예: `T Y U`)
+- `[abc]`: 화음 (동시에 누름)
+- 공백/`|`: 쉼
+
+예시:
+```
+t y u [ti] | o p
+```
+
+## 설정
+
+- **음 간격**: 음과 음 사이의 시간 (초). 작을수록 빨라요
+- **시작 전 대기**: 연주 시작 전 몇 초 기다릴지
+- **반복**: 체크하면 곡이 계속 반복돼요
+
+## 주의사항
+
+- 로블록스가 관리자 권한으로 실행 중이면 이 프로그램도 관리자 권한으로 실행하세요
+- 게임 규정에 따라 자동 입력이 제재 대상이 될 수 있으니 주의하세요
